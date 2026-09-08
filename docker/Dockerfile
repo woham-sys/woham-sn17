@@ -21,10 +21,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3-pip curl ca-certificates git \
         cuda-compat-13-0 \
-        # headless-chrome runtime deps for the render gate
-        libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
+        # headless-chrome runtime deps for the render gate. libnspr4 is easy to miss
+        # and chrome fails with a bare "Code: 127" without it.
+        libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-        libgbm1 libpango-1.0-0 libcairo2 libasound2t64 \
+        libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxss1 libxtst6 \
+        fonts-liberation xdg-utils \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -48,8 +50,11 @@ RUN python3 -m venv /opt/venv \
         pillow==11.1.0
 ENV PATH=/opt/venv/bin:${PATH}
 
+# validate.js resolves the validator package as a SIBLING (../validator/src/index.js),
+# so the directory layout matters -- nesting it under tools/ breaks the import.
 COPY tools/ /app/tools/
-RUN cd /app/tools/validator && npm ci --omit=dev \
+COPY validator/ /app/validator/
+RUN cd /app/validator && npm ci --omit=dev \
     && cd /app/tools && npm ci --omit=dev
 
 COPY miner/ /app/miner/
