@@ -1,3 +1,5 @@
 {
-  "hardware": ["4xH200"]
+  "hardware": [
+    "4xH200"
+  ]
 }

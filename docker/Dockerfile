@@ -1,78 +1,62 @@
-# syntax=docker/dockerfile:1
-#
-# SN17 Image-to-Three.js miner.
-#
-# Everything is pinned: base image by tag+digest-stable tag, pip packages by exact
-# version, the model by revision hash, and node deps by package-lock.
-#
-# The CUDA 13 forward-compatibility layer is installed deliberately. vLLM 0.28 ships
-# torch built for CUDA 13, which refuses to initialise on hosts still running a 570.x
-# driver ("NVIDIA driver on your system is too old (found version 12080)"). On
-# data-center GPUs cuda-compat lets the CUDA 13 runtime work against that driver, so
-# the image runs on both older and newer verification hosts.
+# syntax=docker/dockerfile:1.7
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
 
-FROM nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
-
+# Environment
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    HF_HUB_DISABLE_XET=1 \
-    HF_HOME=/models
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;12.0" \
+    CUDA_HOME=/usr/local/cuda-12.8 \
+    PATH=/usr/local/cuda-12.8/bin:/opt/vllm-env/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:/usr/lib64:$LD_LIBRARY_PATH \
+    PUPPETEER_CACHE_DIR=/opt/puppeteer-cache \
+    NODE_MAJOR=20 \
+    RENDER_POOL_SIZE=32
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-venv python3-pip curl ca-certificates git \
-        cuda-compat-13-0 \
-        # headless-chrome runtime deps for the render gate. libnspr4 is easy to miss
-        # and chrome fails with a bare "Code: 127" without it.
-        libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 \
-        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-        libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxss1 libxtst6 \
-        fonts-liberation xdg-utils \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# System deps + Node.js 20 + Chromium runtime libs
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git build-essential bash gnupg \
+        # headless Chromium runtime
+        fonts-liberation fonts-noto-color-emoji \
+        libnss3 libatk-bridge2.0-0 libx11-xcb1 libxcomposite1 \
+        libxdamage1 libxrandr2 libgbm1 libasound2 \
+        libpangocairo-1.0-0 libgtk-3-0 \
+        libegl1 libgl1-mesa-dri libgles2 \
+        xvfb; \
+    # Node.js 20 LTS via NodeSource
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    rm -rf /var/lib/apt/lists/*
 
-ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH}
+RUN apt-get update && apt-get install -y \
+    speedtest-cli 
 
-WORKDIR /app
+# Python deps
+COPY docker/requirements.vllm.txt /tmp/requirements.vllm.txt
+COPY docker/requirements.txt      /tmp/requirements.txt
 
-# vLLM and the service deps, pinned.
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip==25.2 \
-    && /opt/venv/bin/pip install --no-cache-dir \
-        vllm==0.28.0 \
-        fastapi==0.115.6 \
-        "uvicorn[standard]"==0.34.0 \
-        httpx==0.28.1 \
-        loguru==0.7.3 \
-        pydantic==2.10.4 \
-        huggingface_hub==1.30.0 \
-        numpy==2.2.1 \
-        pillow==11.1.0
-ENV PATH=/opt/venv/bin:${PATH}
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m venv /opt/vllm-env && \
+    /opt/vllm-env/bin/pip install --upgrade pip && \
+    /opt/vllm-env/bin/pip install --no-build-isolation -r /tmp/requirements.vllm.txt && \
+    pip install -r /tmp/requirements.txt
 
-# validate.js resolves the validator package as a SIBLING (../validator/src/index.js),
-# so the directory layout matters -- nesting it under tools/ breaks the import.
-COPY tools/ /app/tools/
-COPY validator/ /app/validator/
-RUN cd /app/validator && npm ci --omit=dev \
-    && cd /app/tools && npm ci --omit=dev
+# Node deps 
+WORKDIR /workspace
+COPY docker/package.json docker/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
 
-COPY miner/ /app/miner/
-COPY main.py entrypoint.sh /app/
-RUN chmod +x /app/entrypoint.sh
+# Add the pipeline service
+COPY pipeline_service     /workspace
+COPY configuration.yaml   /workspace/configuration.yaml
+RUN chmod +x /workspace/run.sh
 
-# Coder model, pinned by revision. Fetched at container start rather than baked in,
-# so the image stays small; the API spec allows 4 h from pod start to /status=ready.
-ENV CODER_REPO=computer-vision-ai-lab/Qwen-3.6-27B-QuietOtter \
-    CODER_REVISION=835818b32fa43ac15b1644aa3f11e1f67500423b \
-    CODER_DIR=/models/coder \
-    VLLM_BASE_URL=http://127.0.0.1:8001/v1 \
-    VLLM_MODEL=quietotter \
-    VLLM_API_KEY=local \
-    GEN_CONCURRENCY=8 \
-    GEN_ATTEMPTS=4 \
-    GEN_MAX_TOKENS=12000
-
-EXPOSE 10006
-
-CMD ["/app/entrypoint.sh"]
+EXPOSE 10006 8001 8002
+CMD ["/workspace/run.sh"]
