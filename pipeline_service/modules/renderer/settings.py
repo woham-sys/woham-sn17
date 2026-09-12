@@ -24,6 +24,10 @@ class RendererConfig(BaseModel):
     bg_color: HexColor | None = None
     lighting: LightingMode = LightingMode.NEUTRAL
     sidecar_count: int = 4
+    # A sidecar dies whenever its in-process SwiftShader GPU crashes, and the supervisor
+    # restarts it within seconds. Waiting for that beats discarding a candidate whose
+    # coder generation already cost ~250s of GPU time.
+    sidecar_wait_s: float = 120.0
     pool_size: int = 2
     judge_multiview: bool = True
     judge_white_bg: HexColor = "ffffff"

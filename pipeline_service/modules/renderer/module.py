@@ -261,6 +261,30 @@ class RendererModule(BaseModule):
         self._dispatch_counter += 1
         return sc
 
+    async def _wait_for_sidecar(self) -> "_Sidecar | None":
+        """Return a live sidecar, waiting briefly for one to be restarted.
+
+        Sidecars exit whenever their browser dies (the in-process GPU takes the whole
+        Chrome process with it) and the supervisor respawns them within seconds. Failing
+        the render immediately throws away a candidate that already cost a full coder
+        generation, so wait for the pool to recover instead. Bounded, and the per-task
+        deadline still applies on top.
+        """
+        sc = self._next_sidecar()
+        if sc is not None:
+            return sc
+        deadline = time.monotonic() + self.config.sidecar_wait_s
+        waited = False
+        while time.monotonic() < deadline and not self._shutting_down:
+            await asyncio.sleep(0.5)
+            sc = self._next_sidecar()
+            if sc is not None:
+                if not waited:
+                    logger.info("[RENDERER] waited for a sidecar to come back")
+                return sc
+            waited = True
+        return None
+
     async def _post_with_retry(self, path: str, payload: dict) -> tuple[httpx.Response, int]:
         """POST to a live sidecar; on a dead-channel error retry once,
         preferring a different sidecar. Renders are idempotent, so with a
@@ -269,7 +293,7 @@ class RendererModule(BaseModule):
         The try covers only the post itself — HTTP-status errors raised by
         callers after this returns are never retried.
         """
-        sc = self._next_sidecar()
+        sc = await self._wait_for_sidecar()
         if sc is None:
             raise RuntimeError("no sidecars available")
         try:
@@ -279,7 +303,7 @@ class RendererModule(BaseModule):
             return resp, sc.idx
         except (*_RETRYABLE_ERRORS, RuntimeError) as exc:
             first_idx = sc.idx
-            retry_sc = self._next_sidecar()
+            retry_sc = await self._wait_for_sidecar()
             if retry_sc is not None and retry_sc.idx == first_idx:
                 alt = self._next_sidecar()
                 if alt is not None and alt.idx != first_idx:

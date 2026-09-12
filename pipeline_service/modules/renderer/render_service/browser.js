@@ -29,9 +29,14 @@ const BASE_ARGS = [
   '--ignore-gpu-blocklist',
 ];
 
+// --in-process-gpu puts SwiftShader inside the browser process, so a GL crash on one
+// bad scene kills the whole Chrome instance -- and with it every in-flight render and
+// the sidecar itself. Measured: ~50 browser deaths per batch, ~46% of all candidates
+// discarded as "no sidecars available". A separate GPU process is Chrome's default and
+// survives a GL crash, which the page-level error path already handles.
 const GPU_ARGS = process.env.USE_GL === 'egl'
   ? ['--use-gl=egl', '--enable-gpu', '--disable-gpu-sandbox']
-  : ['--use-gl=angle', '--use-angle=swiftshader', '--in-process-gpu'];
+  : ['--use-gl=angle', '--use-angle=swiftshader'];
 
 export function isBrowserHealthy() {
   return browser != null && browser.connected;

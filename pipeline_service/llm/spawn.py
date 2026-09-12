@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -137,11 +139,66 @@ def _collect_raw_specs(cfg: dict[str, Any]) -> list[_RawSpec]:
             reasoning_parser=_parse_reasoning_parser(
                 v.get("reasoning_parser", _DEFAULT_REASONING_PARSER)
             ),
-            extra_args=tuple(str(x) for x in (v.get("extra_args") or [])),
+            extra_args=tuple(str(x) for x in (v.get("extra_args") or []))
+            + _lora_args(name, v.get("lora"), cfg),
             data_parallel=int(v.get("data_parallel_size", 1) or 1),
         ))
     return specs
 
+
+# Serve a LoRA adapter on top of the base model: `vllm.lora: {name, repo, revision}` (revision =
+# a full commit sha, so the audit's regeneration loads exactly the live adapter) or `{name, path}`
+# for offline runs. Requests select the adapter by sending `model: <name>`, so the actors on this
+# client must be configured with that name; otherwise the base model would run silently. The
+# adapter is fetched here at the pinned revision, because vLLM's own --lora-modules resolver
+# pulls the Hub's default branch with no way to pin it.
+def _lora_args(client: str, raw: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    if not isinstance(raw, dict) or not raw.get("name"):
+        raise ValueError(f"{client}: vllm.lora needs a name plus repo+revision (or a local path)")
+    name = str(raw["name"])
+    users = {a: str(ac.get("model") or "") for a, ac in (cfg.get("actors") or {}).items()
+             if isinstance(ac, dict) and ac.get("client") == client}
+    if users and name not in users.values():
+        raise ValueError(
+            f"{client}: LoRA {name!r} is served but no actor on this client selects it "
+            f"(actors.*.model = {users}); the base model would run silently"
+        )
+    for actor, model in users.items():
+        if model != name:
+            print(f"[vllm-spawn] WARNING actors.{actor}.model={model!r} does not use LoRA {name!r}", flush=True)
+    if raw.get("path"):  # local adapter directory, for offline validation runs
+        path = src = str(raw["path"])
+    else:
+        repo, rev = str(raw.get("repo") or ""), str(raw.get("revision") or "")
+        if not repo or not re.fullmatch(r"[0-9a-f]{40}", rev):
+            raise ValueError(f"{client}: vllm.lora needs repo and revision = a 40-hex commit sha (got {rev!r})")
+        from huggingface_hub import snapshot_download
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                path = snapshot_download(repo_id=repo, revision=rev)
+                break
+            except Exception as e:  # noqa: BLE001 - transient Hub errors; the last one is surfaced below
+                last = e
+                time.sleep(10 * (attempt + 1))
+        else:
+            raise ValueError(f"{client}: could not fetch LoRA {repo}@{rev} after 3 attempts: {last}") from last
+        src = f"{repo}@{rev}"
+    acfg = os.path.join(path, "adapter_config.json")
+    if not os.path.isfile(acfg):
+        raise ValueError(f"{client}: LoRA {src} has no adapter_config.json at {path}")
+    with open(acfg) as f:
+        rank = int(json.load(f).get("r") or 0)
+    max_rank = max(rank, int(raw.get("max_rank") or 0)) or 16
+    print(f"[vllm-spawn] {client}: LoRA {name} = {src} -> {path} (r={rank}, --max-lora-rank {max_rank})", flush=True)
+    return (
+        "--enable-lora",
+        "--max-lora-rank", str(max_rank),
+        "--max-loras", "1",
+        "--lora-modules", f"{name}={path}",
+    )
 
 # Allocate the GPUs to the specifications
 def _allocate_gpus(specs: list[_RawSpec], all_gpus: list[str]) -> dict[str, list[str]]:
@@ -164,12 +221,31 @@ def _allocate_gpus(specs: list[_RawSpec], all_gpus: list[str]) -> dict[str, list
                 raise ValueError(
                     f"{s.name}: gpu_ids includes {g!r} but visible GPUs are {all_gpus}"
                 )
-            if g in used:
-                raise ValueError(
-                    f"{s.name}: GPU {g} already reserved by another client"
-                )
             used.add(g)
         assigned[s.name] = list(s.explicit_ids)
+
+    # Explicit gpu_ids may overlap: the pipeline alternates between coder-heavy
+    # (generating candidates) and judge-heavy (resolving the bracket) phases, so
+    # dedicating cards to one model leaves the other half of the box idle for
+    # whichever phase is running. Co-locating both models on every card lets each
+    # phase use the whole box. Memory is the operator's to budget -- the summed
+    # gpu_memory_utilization of the clients sharing a card must leave room for both.
+    shared: dict[str, list[str]] = {}
+    for s in specs:
+        if s.explicit_ids is None:
+            continue
+        for g in s.explicit_ids:
+            shared.setdefault(g, []).append(s.name)
+    for g, names in sorted(shared.items()):
+        if len(names) < 2:
+            continue
+        util = sum(sp.gpu_util for sp in specs if sp.name in names)
+        if util > 0.97:
+            raise ValueError(
+                f"GPU {g} is shared by {names} whose gpu_memory_utilization sums "
+                f"to {util:.2f}; leave headroom (<=0.97) or give them separate cards"
+            )
+        print(f"[vllm-spawn] GPU {g} shared by {', '.join(names)} | summed util {util:.2f}", flush=True)
 
     # Phase 2: auto gpu_ids + explicit tp
     free = [g for g in all_gpus if g not in used]
@@ -304,6 +380,12 @@ def _bin_exists(path: str) -> bool:
 def _spawn_one(job: VllmJob) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = job.gpu_ids
+    # vLLM's API server gives up on its engine cores after VLLM_ENGINE_READY_TIMEOUT_S
+    # (default 600) and exits, leaving the engine running but nothing listening. Two
+    # clients loading 50 GB of weights at once, plus MTP and LoRA graph capture, can
+    # exceed that on a cold box: measured 600s+ on 4xH200. Raise it; the readiness
+    # check that follows is what actually bounds startup.
+    env.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "3600")
     cmd = _build_cmd(job)
     print(
         f"[vllm-spawn] Starting vLLM Client: {job.name} | Model: {job.model} | "
@@ -314,6 +396,32 @@ def _spawn_one(job: VllmJob) -> subprocess.Popen:
         flush=True,
     )
     return subprocess.Popen(cmd, env=env, start_new_session=True)
+
+
+def _wait_serving(job: VllmJob, timeout: float = 2400.0) -> bool:
+    """Block until a server answers on its port.
+
+    Only used when jobs share a GPU. vLLM sizes its KV cache from the memory that is
+    free at profiling time, so two servers starting at once on one card both profile
+    an empty card: the first claims a share of the whole card and the second finds no
+    room left for cache blocks and dies. Starting them one at a time makes the second
+    profile what the first actually left.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{job.port}/v1/models"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {job.api_key}"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:  # noqa: BLE001 - not up yet is the normal case here
+            pass
+        time.sleep(5)
+    return False
 
 
 def main() -> int:
@@ -341,8 +449,24 @@ def main() -> int:
     # Spawn each job independently: a missing binary or launch failure for one
     # client must NOT abort the others (e.g. GLM env not built yet should still
     # let the coder come up).
-    failures = 0
+    # Jobs that share a card must come up one at a time, smallest memory budget first:
+    # the later server then profiles the memory its predecessor actually left, instead of
+    # claiming a share of a card it only appears to have to itself.
+    gpu_users: dict[str, int] = {}
     for j in jobs:
+        for g in j.gpu_ids.split(","):
+            gpu_users[g] = gpu_users.get(g, 0) + 1
+    serialize = any(n > 1 for n in gpu_users.values())
+    if serialize:
+        jobs = sorted(jobs, key=lambda j: j.gpu_util)
+        print(
+            "[vllm-spawn] GPUs are shared -> starting servers sequentially: "
+            + ", ".join(f"{j.name}({j.gpu_util})" for j in jobs),
+            flush=True,
+        )
+
+    failures = 0
+    for idx, j in enumerate(jobs):
         if not _bin_exists(j.vllm_bin):
             print(
                 f"[vllm-spawn] ERROR {j.name}: vLLM binary not found: {j.vllm_bin!r} — "
@@ -354,6 +478,16 @@ def main() -> int:
             continue
         try:
             _spawn_one(j)
+            if serialize and idx < len(jobs) - 1:
+                if _wait_serving(j):
+                    print(f"[vllm-spawn] {j.name} is serving; starting the next client", flush=True)
+                else:
+                    print(
+                        f"[vllm-spawn] ERROR {j.name}: never came up; the next client would "
+                        f"mis-profile the shared card",
+                        file=sys.stderr,
+                    )
+                    failures += 1
         except Exception as e:  # noqa: BLE001 - one client's failure must not kill the rest
             print(f"[vllm-spawn] ERROR {j.name}: spawn failed: {e}", file=sys.stderr)
             failures += 1
